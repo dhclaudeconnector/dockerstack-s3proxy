@@ -1,17 +1,15 @@
-tunnel: ccad7977-9f42-4980-ad56-ea5ebdef163c
+tunnel: 52a49a9e-d70b-483b-961c-b1e93a3f97fa
 credentials-file: /etc/cloudflared/credentials.json
 
 ingress:
-  - hostname: main.dockerstack.dpdns.org
+  - hostname: dockerstacks3proxy.dpdns.org
     service: http://caddy:80
-  - hostname: dockerstack.dpdns.org
+  - hostname: main.dockerstacks3proxy.dpdns.org
     service: http://caddy:80
-  - hostname: ttyd.dockerstack.dpdns.org
+  - hostname: ttyd.dockerstacks3proxy.dpdns.org
     service: http://caddy:80
-  - hostname: dozzle.dockerstack.dpdns.org
+  - hostname: dozzle.dockerstacks3proxy.dpdns.org
     service: http://caddy:80
-  - hostname: logs.dockerstack.dpdns.org
-    service: http://caddy:80
-  - hostname: files.dockerstack.dpdns.org
+  - hostname: files.dockerstacks3proxy.dpdns.org
     service: http://caddy:80
   - service: http_status:404
