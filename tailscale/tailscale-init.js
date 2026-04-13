@@ -195,6 +195,51 @@ function pickMostFrequent(items) {
   return best;
 }
 
+// Recursively search any JSON value for the first string that looks like a
+// tailnet domain (*.ts.net).  Applied to raw API response bodies so we catch
+// fields like `magicDNSSuffix`, `tailnetName`, `dnsSuffix`, etc. regardless
+// of where Tailscale decides to put them in the response.
+function deepFindTailnetDomain(obj, _depth) {
+  const depth = typeof _depth === "number" ? _depth : 0;
+  if (depth > 5) return "";
+
+  if (typeof obj === "string") {
+    const c = obj.trim().toLowerCase();
+    return isLikelyTailnetDomain(c) ? c : "";
+  }
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const found = deepFindTailnetDomain(item, depth + 1);
+      if (found) return found;
+    }
+    return "";
+  }
+
+  if (obj !== null && typeof obj === "object") {
+    // Check high-value keys first for speed / clarity in source logs.
+    const priority = [
+      "magicDNSSuffix", "tailnetDomain", "dnsSuffix", "domain",
+      "tailnetName", "name", "fqdn", "suffix",
+    ];
+    for (const k of priority) {
+      if (Object.prototype.hasOwnProperty.call(obj, k)) {
+        const found = deepFindTailnetDomain(obj[k], depth + 1);
+        if (found) return found;
+      }
+    }
+    // Then scan all remaining values.
+    for (const [k, v] of Object.entries(obj)) {
+      if (priority.includes(k)) continue;
+      const found = deepFindTailnetDomain(v, depth + 1);
+      if (found) return found;
+    }
+    return "";
+  }
+
+  return "";
+}
+
 function normalizeHostLabel(value) {
   if (typeof value !== "string") return "";
   return value.trim().toLowerCase();
@@ -821,6 +866,13 @@ async function main() {
       const merged = mergeTagOwners(remotePolicy, requiredTags, defaultOwners);
       remoteAddedTags = merged.addedTags;
       remoteNextPolicy = merged.nextPolicy;
+      // Strategy 0: deep-scan the ACL body in case Tailscale embeds the
+      // tailnet domain there (e.g. a `magicDNSSuffix` or `tailnetName` field).
+      const aclDeep = deepFindTailnetDomain(aclRes.body);
+      if (aclDeep) {
+        apiTailnetDomain = aclDeep;
+        apiTailnetDomainSource = "acl (deep scan)";
+      }
     } else if (aclRes.status === 401) {
       errors.push("Unauthorized (401) when reading ACL. Check OAuth credential scopes.");
     } else if (aclRes.status === 403) {
@@ -856,7 +908,16 @@ async function main() {
           apiTailnetDomain = candidate;
           apiTailnetDomainSource = "dns/searchpaths";
         } else {
-          warnings.push("dns/searchpaths returned no tailnet domain (empty list or no *.ts.net entry).");
+          // searchPaths list exists but contains no *.ts.net entry.
+          // Deep-scan the full response body in case the domain appears in
+          // another field (e.g. a future Tailscale API version).
+          const deep = deepFindTailnetDomain(dnsRes.body);
+          if (deep) {
+            apiTailnetDomain = deep;
+            apiTailnetDomainSource = "dns/searchpaths (deep scan)";
+          } else {
+            warnings.push("dns/searchpaths returned no tailnet domain (empty list or no *.ts.net entry).");
+          }
         }
       }
     } else if (dnsRes.status === 401) {
@@ -893,8 +954,16 @@ async function main() {
           apiTailnetDomain = candidate;
           apiTailnetDomainSource = "dns/configuration";
         } else {
-          const topLevelKeys = Object.keys(dnsCfgRes.body);
-          warnings.push(`dns/configuration did not include a usable tailnet search path (keys: ${topLevelKeys.join(", ") || "(none)"}).`);
+          // searchPaths didn't help — deep-scan the whole body.
+          // Catches fields like `magicDNSSuffix`, `tailnetName`, `dnsSuffix`, etc.
+          const deep = deepFindTailnetDomain(dnsCfgRes.body);
+          if (deep) {
+            apiTailnetDomain = deep;
+            apiTailnetDomainSource = "dns/configuration (deep scan)";
+          } else {
+            const topLevelKeys = Object.keys(dnsCfgRes.body);
+            warnings.push(`dns/configuration did not include a usable tailnet search path (keys: ${topLevelKeys.join(", ") || "(none)"}).`);
+          }
         }
       } else if (dnsCfgRes.status === 401) {
         warnings.push("Cannot read dns/configuration (401). Missing or invalid DNS read scope.");
@@ -959,6 +1028,8 @@ async function main() {
   }
 
   // 4) Tailnet HTTPS setting (enable if currently disabled)
+  //    Also opportunistically deep-scan the body for a *.ts.net domain
+  //    (e.g. a future `tailnetDomain` field Tailscale may add to settings).
   try {
     const settingsRes = await apiRequestJson({
       method: "GET",
@@ -969,6 +1040,14 @@ async function main() {
     if (settingsRes.status === 200 && settingsRes.body && typeof settingsRes.body === "object") {
       currentHttpsEnabled = settingsRes.body.httpsEnabled === true;
       shouldEnableHttps = !currentHttpsEnabled;
+      // Strategy 3.5: deep-scan settings body for *.ts.net domain.
+      if (!apiTailnetDomain) {
+        const deep = deepFindTailnetDomain(settingsRes.body);
+        if (deep) {
+          apiTailnetDomain = deep;
+          apiTailnetDomainSource = "tailnet/settings (deep scan)";
+        }
+      }
     } else if (settingsRes.status === 401) {
       errors.push("Unauthorized (401) when reading tailnet settings. OAuth token needs networking settings read access.");
     } else if (settingsRes.status === 403) {
@@ -1058,7 +1137,10 @@ async function main() {
       warnings.push(`Could not infer TAILSCALE_TAILNET_DOMAIN from Tailscale API; using existing env value (unverified): ${existingTailnetDomain}.`);
     } else {
       errors.push(
-        "Could not infer TAILSCALE_TAILNET_DOMAIN from Tailscale API (tried: dns/searchpaths, dns/configuration, devices). Set TAILSCALE_TAILNET_DOMAIN manually from Tailscale Admin DNS settings.",
+        "Could not infer TAILSCALE_TAILNET_DOMAIN from Tailscale API (tried: acl, dns/searchpaths, dns/configuration, devices, settings).\n" +
+        "    → Find your tailnet domain at: https://login.tailscale.com/admin/dns\n" +
+        "      Look for the 'Tailnet name' or 'Magic DNS' section.  It ends with .ts.net.\n" +
+        "    → Then set in your .env:  TAILSCALE_TAILNET_DOMAIN=tail03fb4e.ts.net",
       );
     }
   }
