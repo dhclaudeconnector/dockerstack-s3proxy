@@ -25,6 +25,7 @@
     form { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 8px; }
     input, select, textarea { width: 100%; box-sizing: border-box; background: #0f172a; border: 1px solid #2c3c65; color: #e5e7eb; border-radius: 8px; padding: 8px; }
     textarea { min-height: 82px; }
+    .span2 { grid-column: span 2; }
     .hint { font-size: 12px; color: #9ca3af; margin-top: 8px; }
   </style>
 </head>
@@ -67,8 +68,34 @@
 
   <section class="card">
     <h2>Accounts</h2>
+    <form id="accountForm">
+      <input id="accountId" placeholder="accountId" required />
+      <input id="accountAccessKeyId" placeholder="accessKeyId" required />
+      <input id="accountSecretKey" placeholder="secretAccessKey (để trống = giữ nguyên khi edit)" />
+      <input id="accountEndpoint" class="span2" placeholder="endpoint (https://...)" required />
+      <input id="accountRegion" placeholder="region (vd: ap-southeast-1)" required />
+      <input id="accountBucket" placeholder="bucket" required />
+      <select id="accountAddressingStyle">
+        <option value="path">path</option>
+        <option value="virtual">virtual</option>
+      </select>
+      <select id="accountPayloadSigningMode">
+        <option value="unsigned">unsigned</option>
+        <option value="signed">signed</option>
+      </select>
+      <input id="accountQuotaBytes" type="number" min="1" placeholder="quotaBytes" />
+      <input id="accountUsedBytes" type="number" min="0" placeholder="usedBytes" />
+      <select id="accountActive">
+        <option value="true">active</option>
+        <option value="false">inactive</option>
+      </select>
+      <input id="accountAddedAt" type="number" min="0" placeholder="addedAt (epoch ms)" />
+      <button type="submit">Lưu account</button>
+      <button type="button" id="accountResetBtn" class="secondary">Clear form</button>
+    </form>
+    <p class="hint">Edit: bấm nút edit trên bảng để nạp dữ liệu; secret để trống sẽ giữ secret cũ.</p>
     <table>
-      <thead><tr><th>Account</th><th>Bucket</th><th>Used/Quota</th><th>Percent</th><th>Status</th><th>Action</th></tr></thead>
+      <thead><tr><th>Account</th><th>Endpoint/Bucket</th><th>Used/Quota</th><th>Percent</th><th>Status</th><th>Action</th></tr></thead>
       <tbody id="accountsBody"></tbody>
     </table>
   </section>
@@ -88,6 +115,9 @@ const logEl = document.getElementById('log')
 const refreshBtn = document.getElementById('refreshBtn')
 const testAllBtn = document.getElementById('testAllBtn')
 const cronForm = document.getElementById('cronForm')
+const accountForm = document.getElementById('accountForm')
+const accountResetBtn = document.getElementById('accountResetBtn')
+let latestOverview = null
 
 function fmtBytes(bytes) {
   if (!bytes) return '0 B'
@@ -117,8 +147,69 @@ function bindCronForm(kinds) {
   select.innerHTML = kinds.map((kind) => `<option value="${kind}">${kind}</option>`).join('')
 }
 
+function resetAccountForm() {
+  document.getElementById('accountId').value = ''
+  document.getElementById('accountAccessKeyId').value = ''
+  document.getElementById('accountSecretKey').value = ''
+  document.getElementById('accountEndpoint').value = ''
+  document.getElementById('accountRegion').value = ''
+  document.getElementById('accountBucket').value = ''
+  document.getElementById('accountAddressingStyle').value = 'path'
+  document.getElementById('accountPayloadSigningMode').value = 'unsigned'
+  document.getElementById('accountQuotaBytes').value = ''
+  document.getElementById('accountUsedBytes').value = ''
+  document.getElementById('accountActive').value = 'true'
+  document.getElementById('accountAddedAt').value = ''
+}
+
+function fillAccountForm(account) {
+  document.getElementById('accountId').value = account.accountId || ''
+  document.getElementById('accountAccessKeyId').value = account.accessKeyId || ''
+  document.getElementById('accountSecretKey').value = ''
+  document.getElementById('accountEndpoint').value = account.endpoint || ''
+  document.getElementById('accountRegion').value = account.region || ''
+  document.getElementById('accountBucket').value = account.bucket || ''
+  document.getElementById('accountAddressingStyle').value = account.addressingStyle || 'path'
+  document.getElementById('accountPayloadSigningMode').value = account.payloadSigningMode || 'unsigned'
+  document.getElementById('accountQuotaBytes').value = String(account.quotaBytes ?? '')
+  document.getElementById('accountUsedBytes').value = String(account.usedBytes ?? '')
+  document.getElementById('accountActive').value = String(Boolean(account.active))
+  document.getElementById('accountAddedAt').value = String(account.addedAt ?? '')
+}
+
+function buildAccountPayloadFromForm() {
+  const accountId = document.getElementById('accountId').value.trim()
+  const accessKeyId = document.getElementById('accountAccessKeyId').value.trim()
+  const secretAccessKey = document.getElementById('accountSecretKey').value.trim()
+  const endpoint = document.getElementById('accountEndpoint').value.trim()
+  const region = document.getElementById('accountRegion').value.trim()
+  const bucket = document.getElementById('accountBucket').value.trim()
+  const addressingStyle = document.getElementById('accountAddressingStyle').value
+  const payloadSigningMode = document.getElementById('accountPayloadSigningMode').value
+  const quotaRaw = document.getElementById('accountQuotaBytes').value.trim()
+  const usedRaw = document.getElementById('accountUsedBytes').value.trim()
+  const addedAtRaw = document.getElementById('accountAddedAt').value.trim()
+  const active = document.getElementById('accountActive').value === 'true'
+
+  return {
+    accountId,
+    accessKeyId,
+    secretAccessKey: secretAccessKey || undefined,
+    endpoint,
+    region,
+    bucket,
+    addressingStyle,
+    payloadSigningMode,
+    quotaBytes: quotaRaw ? Number(quotaRaw) : undefined,
+    usedBytes: usedRaw ? Number(usedRaw) : undefined,
+    addedAt: addedAtRaw ? Number(addedAtRaw) : undefined,
+    active,
+  }
+}
+
 async function refresh() {
   const body = await api('/admin/api/overview')
+  latestOverview = body
   const healthClass = body.status === 'ok' ? 'ok' : 'bad'
 
   metaEl.innerHTML = `
@@ -193,17 +284,47 @@ async function refresh() {
 
   accountsBody.innerHTML = body.accounts.map((account) => `
     <tr>
-      <td>${account.accountId}</td>
-      <td>${account.bucket}</td>
+      <td>${account.accountId}<br/><span class="hint">${account.accessKeyId || '-'} | ${account.addressingStyle || 'path'} | ${account.payloadSigningMode || 'unsigned'}</span></td>
+      <td>${account.endpoint}<br/><span class="hint">${account.bucket}</span></td>
       <td>${fmtBytes(account.usedBytes)} / ${fmtBytes(account.quotaBytes)}</td>
       <td>${account.usedPercent}%</td>
       <td class="${account.active ? 'ok' : 'bad'}">${account.active ? 'active' : 'inactive'}</td>
-      <td><button data-account="${account.accountId}">Test</button></td>
+      <td>
+        <button data-account-test="${account.accountId}">Test</button>
+        <button class="secondary" data-account-edit="${account.accountId}">Edit</button>
+        <button class="danger" data-account-delete="${account.accountId}">Delete</button>
+      </td>
     </tr>
   `).join('')
 
-  accountsBody.querySelectorAll('button[data-account]').forEach((button) => {
-    button.addEventListener('click', () => runTest(button.getAttribute('data-account')))
+  accountsBody.querySelectorAll('button[data-account-test]').forEach((button) => {
+    button.addEventListener('click', () => runTest(button.getAttribute('data-account-test')))
+  })
+
+  accountsBody.querySelectorAll('button[data-account-edit]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const accountId = button.getAttribute('data-account-edit')
+      const account = body.accounts.find((item) => item.accountId === accountId)
+      if (!account) return
+      fillAccountForm(account)
+    })
+  })
+
+  accountsBody.querySelectorAll('button[data-account-delete]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const accountId = button.getAttribute('data-account-delete')
+      if (!accountId) return
+      if (!confirm(`Delete account "${accountId}"?`)) return
+      try {
+        const result = await api(`/admin/api/accounts/${encodeURIComponent(accountId)}`, { method: 'DELETE' })
+        if (result.warning) {
+          logEl.textContent = result.warning
+        }
+        await refresh()
+      } catch (err) {
+        logEl.textContent = String(err)
+      }
+    })
   })
 }
 
@@ -242,6 +363,30 @@ cronForm.addEventListener('submit', async (event) => {
   } catch (err) {
     logEl.textContent = String(err)
   }
+})
+
+accountForm.addEventListener('submit', async (event) => {
+  event.preventDefault()
+  try {
+    const payload = buildAccountPayloadFromForm()
+    const body = await api('/admin/api/accounts', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (body.warning) {
+      logEl.textContent = body.warning
+    } else {
+      logEl.textContent = JSON.stringify(body, null, 2)
+    }
+    await refresh()
+  } catch (err) {
+    logEl.textContent = String(err)
+  }
+})
+
+accountResetBtn.addEventListener('click', () => {
+  resetAccountForm()
 })
 
 refreshBtn.addEventListener('click', refresh)

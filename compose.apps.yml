@@ -57,6 +57,10 @@ services:
       # Public HTTP sites behind Cloudflare Tunnel.
       - "caddy=http://${PROJECT_NAME}.${DOMAIN}, http://main.${DOMAIN}, http://${DOMAIN}, http://${PROJECT_NAME}.${TAILSCALE_TAILNET_DOMAIN}"
       - "caddy.reverse_proxy={{upstreams ${APP_PORT:-3000}}}"
+      # Chỉ bảo vệ /admin* bằng basic_auth
+      - "caddy.@admin=path /admin*"
+      - "caddy.basic_auth=@admin"
+      - "caddy.basic_auth.${CADDY_AUTH_USER:-admin}=${CADDY_AUTH_HASH}"
       # - "caddy.basic_auth=/*"
       # - "caddy.basic_auth.${CADDY_AUTH_USER:-admin}=${CADDY_AUTH_HASH}"
       # Internal HTTPS site for Tailscale / trusted LAN access.

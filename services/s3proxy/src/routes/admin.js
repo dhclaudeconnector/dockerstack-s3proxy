@@ -15,8 +15,16 @@ import {
 } from '@aws-sdk/client-s3'
 
 import config from '../config.js'
-import { getAllAccounts } from '../db.js'
-import { getAccountsStats } from '../accountPool.js'
+import {
+  deleteAccount,
+  getAccountById,
+  getAllAccounts,
+  getTrackedRoutesByAccount,
+  upsertAccount,
+} from '../db.js'
+import { getAccountsStats, reloadAccountsFromRTDB, reloadAccountsFromSQLite } from '../accountPool.js'
+import { rtdbBatchPatch } from '../firebase.js'
+import { buildRtdbAccountPath, suggestAccountId, validateAccountIdForRealtime } from '../accountId.js'
 import { getRtdbState } from './health.js'
 import {
   getCronJobKinds,
@@ -38,14 +46,173 @@ function formatPercent(used, quota) {
 function toPublicAccount(row) {
   return {
     accountId: row.account_id,
+    accessKeyId: row.access_key_id,
     endpoint: row.endpoint,
     region: row.region,
     bucket: row.bucket,
+    addressingStyle: row.addressing_style ?? 'path',
+    payloadSigningMode: row.payload_signing_mode ?? 'unsigned',
     active: row.active === 1 || row.active === true,
     usedBytes: row.used_bytes ?? 0,
     quotaBytes: row.quota_bytes ?? 0,
     usedPercent: formatPercent(row.used_bytes ?? 0, row.quota_bytes ?? 0),
     addedAt: row.added_at ?? null,
+    hasSecret: Boolean(row.secret_key),
+  }
+}
+
+function normalizeString(value) {
+  if (value === undefined || value === null) return ''
+  return String(value).trim()
+}
+
+function normalizeBoolean(value, fallback = true) {
+  if (value === undefined || value === null || value === '') return fallback
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+
+  const normalized = String(value).trim().toLowerCase()
+  if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true
+  if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false
+  return fallback
+}
+
+function normalizeAddressingStyle(value) {
+  const raw = normalizeString(value).toLowerCase()
+  if (!raw) return 'path'
+  if (['path', 'path-style', 'path_style'].includes(raw)) return 'path'
+  if (['virtual', 'virtual-hosted', 'virtual_hosted', 'virtual-hosted-style'].includes(raw)) return 'virtual'
+  return ''
+}
+
+function normalizePayloadSigningMode(value) {
+  const raw = normalizeString(value).toLowerCase()
+  if (!raw) return 'unsigned'
+  if (['unsigned', 'unsigned-payload', 'unsigned_payload'].includes(raw)) return 'unsigned'
+  if (['signed', 'strict', 'required'].includes(raw)) return 'signed'
+  return ''
+}
+
+function normalizePositiveInteger(value, fallback, fieldName, errors) {
+  if (value === undefined || value === null || value === '') return fallback
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    errors.push(`${fieldName} must be a positive number`)
+    return fallback
+  }
+  return Math.trunc(numeric)
+}
+
+function normalizeNonNegativeInteger(value, fallback, fieldName, errors) {
+  if (value === undefined || value === null || value === '') return fallback
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    errors.push(`${fieldName} must be a non-negative number`)
+    return fallback
+  }
+  return Math.trunc(numeric)
+}
+
+function toRtdbAccountDocument(account) {
+  return {
+    accountId: account.account_id,
+    accessKeyId: account.access_key_id,
+    secretAccessKey: account.secret_key,
+    endpoint: account.endpoint,
+    region: account.region,
+    bucket: account.bucket,
+    addressingStyle: account.addressing_style ?? 'path',
+    payloadSigningMode: account.payload_signing_mode ?? 'unsigned',
+    quotaBytes: account.quota_bytes,
+    usedBytes: account.used_bytes,
+    active: account.active === 1,
+    addedAt: account.added_at,
+  }
+}
+
+function normalizeAccountPayload(payload, existing = null) {
+  const errors = []
+
+  const accountIdInput = normalizeString(payload.accountId ?? payload.account_id ?? existing?.account_id)
+  const accountIdValidation = validateAccountIdForRealtime(accountIdInput)
+  if (!accountIdValidation.valid) {
+    let message = `accountId ${accountIdValidation.reason}`
+    const suggestion = suggestAccountId(accountIdInput)
+    if (suggestion && suggestion !== accountIdValidation.accountId) {
+      message += ` (suggested: ${suggestion})`
+    }
+    errors.push(message)
+  }
+
+  const accessKeyId = normalizeString(payload.accessKeyId ?? payload.access_key_id ?? existing?.access_key_id)
+  const secretKey = normalizeString(payload.secretAccessKey ?? payload.secret_key) || existing?.secret_key || ''
+  const endpoint = normalizeString(payload.endpoint ?? existing?.endpoint)
+  const region = normalizeString(payload.region ?? existing?.region)
+  const bucket = normalizeString(payload.bucket ?? existing?.bucket)
+  const addressingStyle = normalizeAddressingStyle(payload.addressingStyle ?? payload.addressing_style ?? existing?.addressing_style)
+  const payloadSigningMode = normalizePayloadSigningMode(
+    payload.payloadSigningMode ?? payload.payload_signing_mode ?? existing?.payload_signing_mode,
+  )
+  const quotaBytes = normalizePositiveInteger(
+    payload.quotaBytes ?? payload.quota_bytes,
+    existing?.quota_bytes ?? 5_368_709_120,
+    'quotaBytes',
+    errors,
+  )
+  const usedBytes = normalizeNonNegativeInteger(
+    payload.usedBytes ?? payload.used_bytes,
+    existing?.used_bytes ?? 0,
+    'usedBytes',
+    errors,
+  )
+  const addedAt = normalizeNonNegativeInteger(
+    payload.addedAt ?? payload.added_at,
+    existing?.added_at ?? Date.now(),
+    'addedAt',
+    errors,
+  )
+  const active = normalizeBoolean(payload.active, existing ? (existing.active === 1 || existing.active === true) : true) ? 1 : 0
+
+  if (!accessKeyId) errors.push('accessKeyId is required')
+  if (!secretKey) errors.push('secretAccessKey is required')
+  if (!endpoint) errors.push('endpoint is required')
+  if (!region) errors.push('region is required')
+  if (!bucket) errors.push('bucket is required')
+  if (!addressingStyle) errors.push('addressingStyle must be one of: path, virtual')
+  if (!payloadSigningMode) errors.push('payloadSigningMode must be one of: unsigned, signed')
+
+  if (endpoint) {
+    try {
+      const parsed = new URL(endpoint)
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        errors.push('endpoint must use http or https')
+      }
+    } catch {
+      errors.push('endpoint must be a valid URL')
+    }
+  }
+
+  if (errors.length > 0) {
+    return { errors, row: null, accountId: accountIdValidation.accountId || accountIdInput }
+  }
+
+  return {
+    errors,
+    accountId: accountIdValidation.accountId,
+    row: {
+      account_id: accountIdValidation.accountId,
+      access_key_id: accessKeyId,
+      secret_key: secretKey,
+      endpoint,
+      region,
+      bucket,
+      addressing_style: addressingStyle,
+      payload_signing_mode: payloadSigningMode,
+      quota_bytes: quotaBytes,
+      used_bytes: usedBytes,
+      active,
+      added_at: addedAt,
+    },
   }
 }
 
@@ -152,6 +319,118 @@ export default async function adminRoutes(fastify, _opts) {
       cronKinds: getCronJobKinds(),
       accounts,
       compatibility: pocketbaseCompatibility(),
+    })
+  })
+
+  fastify.get('/admin/api/accounts', {
+    config: { skipAuth: true },
+  }, async (_request, reply) => {
+    const accounts = getAllAccounts().map(toPublicAccount)
+    return reply.send({
+      total: accounts.length,
+      accounts,
+    })
+  })
+
+  fastify.post('/admin/api/accounts', {
+    config: { skipAuth: true },
+  }, async (request, reply) => {
+    const payload = parseBodyObject(request.body)
+    const requestedId = normalizeString(payload.accountId ?? payload.account_id)
+    const existing = requestedId ? getAccountById(requestedId) : null
+    const normalized = normalizeAccountPayload(payload, existing)
+
+    if (normalized.errors.length > 0 || !normalized.row) {
+      return reply.code(400).send({
+        ok: false,
+        error: 'Invalid account payload',
+        errors: normalized.errors,
+      })
+    }
+
+    const beforeUpsert = getAccountById(normalized.row.account_id)
+    upsertAccount(normalized.row)
+    reloadAccountsFromSQLite()
+
+    const updates = {
+      [buildRtdbAccountPath(normalized.row.account_id)]: toRtdbAccountDocument(normalized.row),
+    }
+
+    let rtdbSynced = true
+    let warning = ''
+    try {
+      await rtdbBatchPatch(updates)
+      await reloadAccountsFromRTDB()
+    } catch (err) {
+      rtdbSynced = false
+      warning = `Account saved locally, but RTDB sync failed: ${err?.message ?? String(err)}`
+      request.log.warn({ err, accountId: normalized.row.account_id }, 'admin account sync failed')
+      reloadAccountsFromSQLite()
+    }
+
+    return reply.send({
+      ok: true,
+      action: beforeUpsert ? 'updated' : 'created',
+      rtdbSynced,
+      warning: warning || undefined,
+      account: toPublicAccount(normalized.row),
+    })
+  })
+
+  fastify.delete('/admin/api/accounts/:accountId', {
+    config: { skipAuth: true },
+  }, async (request, reply) => {
+    const accountId = normalizeString(request.params?.accountId)
+    if (!accountId) {
+      return reply.code(400).send({ ok: false, error: 'accountId is required' })
+    }
+
+    const existing = getAccountById(accountId)
+    if (!existing) {
+      return reply.code(404).send({ ok: false, error: 'account not found' })
+    }
+
+    const trackedRoutes = getTrackedRoutesByAccount(accountId)
+    if (trackedRoutes.length > 0) {
+      return reply.code(409).send({
+        ok: false,
+        error: `account has ${trackedRoutes.length} tracked route(s), cannot delete`,
+      })
+    }
+
+    try {
+      deleteAccount(accountId)
+    } catch (err) {
+      const message = err?.message ?? String(err)
+      if (message.includes('FOREIGN KEY')) {
+        return reply.code(409).send({
+          ok: false,
+          error: 'account still referenced by object metadata, cannot delete',
+        })
+      }
+      throw err
+    }
+    reloadAccountsFromSQLite()
+
+    let rtdbSynced = true
+    let warning = ''
+    try {
+      await rtdbBatchPatch({
+        [buildRtdbAccountPath(accountId)]: null,
+      })
+      await reloadAccountsFromRTDB()
+    } catch (err) {
+      rtdbSynced = false
+      warning = `Account deleted locally, but RTDB sync failed: ${err?.message ?? String(err)}`
+      request.log.warn({ err, accountId }, 'admin account delete sync failed')
+      reloadAccountsFromSQLite()
+    }
+
+    return reply.send({
+      ok: true,
+      accountId,
+      rtdbSynced,
+      warning: warning || undefined,
     })
   })
 

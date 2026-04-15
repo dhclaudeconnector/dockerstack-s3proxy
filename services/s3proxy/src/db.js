@@ -301,6 +301,7 @@ const stmts = {
   getAllAccounts: db.prepare(`SELECT * FROM accounts ORDER BY used_bytes ASC, account_id ASC`),
   getAllActiveAccounts: db.prepare(`SELECT * FROM accounts WHERE active = 1 ORDER BY used_bytes ASC, account_id ASC`),
   getAccountById: db.prepare(`SELECT * FROM accounts WHERE account_id = ?`),
+  deleteAccountById: db.prepare(`DELETE FROM accounts WHERE account_id = ?`),
   setUsedBytesAbsolute: db.prepare(`
     UPDATE accounts
     SET used_bytes = MAX(0, @bytes)
@@ -502,6 +503,10 @@ export function getAllActiveAccounts() {
 
 export function getAccountById(accountId) {
   return stmts.getAccountById.get(accountId)
+}
+
+export function deleteAccount(accountId) {
+  stmts.deleteAccountById.run(accountId)
 }
 
 export function setUsedBytesAbsolute(accountId, bytes) {
