@@ -72,3 +72,8 @@ See `docs/DEPLOY.md` for the full migration guide.
 - Khi lưu account thành công, form account và phần thêm nhanh từ dịch vụ S3 sẽ tự clear
 
 ---
+
+## 2026-04-16 - tăng tốc image trong compose.ops.yml
+- Sửa image `webssh` để tránh bước `apt-get` trên Ubuntu vốn kéo package rất chậm.
+- Chuyển `webssh` sang base Alpine + `openssh-client-default`, nên thời gian build lại ngắn hơn đáng kể.
+- Pin version cho `dozzle` và `webssh-windows`, đồng thời thêm `pull_policy: missing` để hạn chế tự kéo lại image khi local đã có sẵn.

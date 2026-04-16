@@ -71,3 +71,8 @@
 - Đồng bộ metadata + usage về RTDB sau khi replace/delete tracked file từ admin
 
 ---
+
+## 2026-04-16 ops image performance tune
+- `services/webssh/Dockerfile`: đổi từ `tsl0922/ttyd:latest` + `apt-get install openssh-client` sang `tsl0922/ttyd:1.7.8-alpine` + `apk add --no-cache openssh-client-default` để giảm mạnh thời gian rebuild webssh.
+- `docker-compose/compose.ops.yml`: pin `dozzle` sang `v10.3.3`, `webssh-windows` sang `alpine/socat:1.8.0.3`, thêm `pull_policy: missing` cho image ngoài, và đặt tên image local `dockerstack-webssh:local` cho service webssh để cache ổn định hơn.
+- `docs/services/webssh.md`: bổ sung ghi chú vì sao chuyển sang Alpine và cách giảm thời gian build/pull.
