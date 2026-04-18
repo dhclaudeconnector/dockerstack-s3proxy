@@ -5,6 +5,9 @@
 name: dockerstack-s3proxy
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
   schedule:
     - cron: "3 0 * * *" # 07:03 ICT
     - cron: "3 1 * * *" # 08:03 ICT
